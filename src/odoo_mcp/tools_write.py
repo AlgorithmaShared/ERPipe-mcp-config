@@ -24,7 +24,7 @@ from .agent_tools import (
     validate_write_report,
     verify_write_approval,
 )
-from .audit import record_write_event
+from .audit import capture_before_image, record_write_event
 from .diagnostics import (
     DESTRUCTIVE_METHODS,
     JSON2_POSITIONAL_ARG_MAP,
@@ -37,7 +37,11 @@ from .tool_helpers import (
     validate_method_name,
     validate_model_name,
 )
-from .write_policy import chatter_direct_enabled, side_effect_method_allowed, writes_enabled
+from .write_policy import (
+    chatter_direct_enabled,
+    side_effect_method_allowed,
+    writes_enabled,
+)
 from .rate_limit import check_rate
 from .server_core import (
     DESTRUCTIVE_TOOL,
@@ -129,6 +133,7 @@ def _resolve_binary_from_path_fields(
 def _srv() -> Any:
     """Late import of server module to resolve patchable symbols at call time."""
     from . import server
+
     return server
 
 
@@ -273,7 +278,6 @@ def _coerce_values_json(
     return values, values_list
 
 
-
 @mcp.tool(
     description="Preview create, write, or unlink without executing it",
     annotations=PREVIEW_TOOL,
@@ -363,7 +367,9 @@ def validate_write(
         resolved_binary_values: Dict[str, Any] = {}
         if values:
             values, resolved_binary_values = _resolve_binary_from_path_fields(values)
-        if resolved_binary_values and (fields_metadata is not None or not use_live_metadata):
+        if resolved_binary_values and (
+            fields_metadata is not None or not use_live_metadata
+        ):
             return {
                 "success": False,
                 "tool": "validate_write",
@@ -642,7 +648,37 @@ def _execute_approved_write_gated(
         else:
             _, odoo = app_context.get_client(approval_instance)
 
+        # An unlink is the one operation whose evidence disappears with the
+        # data. Read the records while they still exist so the audit entry can
+        # say what was lost, not merely that something was. Never let this
+        # block the delete itself.
+        before_image = None
+        if operation == "unlink":
+            before_image = capture_before_image(
+                odoo,
+                model,
+                record_ids,
+                instance=approval_instance or "default",
+            )
+
         result = odoo.execute_method(model, operation, *args, **kwargs)
+        if operation == "unlink":
+            record_write_event(
+                "execute_approved_write",
+                outcome="success",
+                model=model,
+                operation=operation,
+                record_ids=record_ids,
+                instance=approval_instance or _srv().resolve_default_instance_name(),
+                token=str(approval.get("token", "")) or None,
+                identity=identity.audit_fields() if identity else None,
+                before_image=before_image,
+                detail=(
+                    None
+                    if before_image is not None
+                    else "before-image unavailable; record contents were not captured"
+                ),
+            )
         app_context.write_approvals.pop(str(approval.get("token", "")), None)
         return {
             "success": True,
@@ -651,6 +687,11 @@ def _execute_approved_write_gated(
             "operation": operation,
             "result": result,
             "instance": approval_instance or _srv().resolve_default_instance_name(),
+            **(
+                {"before_image_captured": before_image is not None}
+                if operation == "unlink"
+                else {}
+            ),
         }
     except Exception as e:
         return {"success": False, "tool": "execute_approved_write", "error": str(e)}
@@ -871,11 +912,14 @@ def execute_method(
         Optional[List[Any]], Field(description="Optional positional method arguments.")
     ] = None,
     kwargs: Annotated[
-        Optional[Dict[str, Any]], Field(description="Optional keyword method arguments.")
+        Optional[Dict[str, Any]],
+        Field(description="Optional keyword method arguments."),
     ] = None,
     instance: Annotated[
         Optional[str],
-        Field(description="Optional configured Odoo instance name; uses the default if omitted."),
+        Field(
+            description="Optional configured Odoo instance name; uses the default if omitted."
+        ),
     ] = None,
 ) -> Dict[str, Any]:
     """
