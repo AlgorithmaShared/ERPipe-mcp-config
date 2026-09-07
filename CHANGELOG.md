@@ -41,6 +41,28 @@ All notable changes to this project will be documented in this file.
   `algorithma-vnext-architecture.md`, `per-request-identity.md`,
   `migration-from-algorithma-mcp.md`.
 
+## [1.5.0] - 2026-09-07
+
+### Added
+
+- **The audit log records what a deleted record contained, not just its id.**
+  The MCP audit had 198 entries with `"detail": null`, 27 of them deletes, so a
+  customer asking what was removed could be told the id and nothing else.
+  `capture_before_image()` snapshots the record **through the field ACL**
+  immediately before `unlink` and stores it on the audit entry:
+
+  ```json
+  "before_image": [{"id": 7, "name": "Offerte Muller AG", "amount_total": 4200.0}]
+  ```
+
+  The path is `delete_record` → `gated_unlink` → `execute_approved_write`, so
+  the one function covers both plugin tools without touching plugin code.
+  Going through the field ACL means a snapshot can never expose a field the
+  user could not already read (there is a test for exactly that), and a
+  snapshot failure never blocks the delete — the entry records
+  `before_image_captured: false` instead. This makes deletes **explainable,
+  not reversible**; real undo remains separate work.
+
 ## [1.3.2] - 2026-08-19
 
 ### Changed
