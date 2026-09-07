@@ -35,7 +35,7 @@ import re
 import threading
 import time
 from datetime import date, datetime, timedelta, timezone
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Union
 from zoneinfo import ZoneInfo
 
 from mcp.server.mcpserver import Context
@@ -155,6 +155,34 @@ def to_odoo_utc_marked(value: datetime) -> str:
 def format_local(value: datetime) -> str:
     local = value.astimezone(_local_tz())
     return local.strftime("%a %d.%m.%Y %H:%M")
+
+
+def _coerce_values(
+    values: Optional[Dict[str, Any]],
+    values_json: Optional[Union[str, Dict[str, Any]]],
+) -> Optional[Dict[str, Any]]:
+    """Accept a write payload as JSON text as well as a real object.
+
+    Same reasoning as ``_coerce_values_json`` in the core write tools: the
+    object parameter becomes an ``anyOf`` union in the tool schema and models
+    author it unreliably - it arrives as ``{}`` often enough that the agent
+    prompt tells the model to always send JSON text instead. The tools that
+    only accepted the object form therefore failed on exactly the calls the
+    prompt instructed.
+    """
+    if values:
+        return values
+    if not values_json:
+        return values
+    if isinstance(values_json, dict):
+        return values_json
+    try:
+        parsed = json.loads(values_json)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"values_json ist kein gueltiges JSON: {exc}") from exc
+    if not isinstance(parsed, dict):
+        raise ValueError("values_json muss ein JSON-Objekt sein.")
+    return parsed
 
 
 # Odoo stores datetimes in UTC and renders them in the reader's timezone. The
@@ -1403,10 +1431,11 @@ def update_record(
     ctx: Context,
     model: str,
     record_id: int,
-    values: Dict[str, Any],
+    values: Optional[Dict[str, Any]] = None,
     bestaetigen: bool = False,
     freigabe_code: Optional[str] = None,
     instance: Optional[str] = None,
+    values_json: Optional[Union[str, Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     """Aendert Feldwerte eines bestehenden Datensatzes (beliebiges Modell).
 
@@ -1418,11 +1447,20 @@ def update_record(
     z.B. [[4, ID]] zum Hinzufuegen, [[3, ID]] zum Entfernen, [[6, 0, [IDs]]]
     zum Ersetzen. Erster Aufruf zeigt die Karte, zweiter Aufruf mit
     bestaetigen=true + freigabe_code schreibt.
+
+    Zeiten immer in lokaler Zeit uebergeben (z.B. "2026-09-09 10:00"); die
+    Umrechnung nach UTC uebernimmt das Werkzeug.
+
+    ``values_json`` nimmt dieselben Werte als JSON-Text entgegen - aus dem
+    gleichen Grund wie bei ``preview_write``/``validate_write``: das
+    Objektfeld kommt aus dem Chat regelmaessig leer an, ein String kommt
+    zuverlaessig an.
     """
     tool = "update_record"
     try:
         api = _core()
         instance_name, odoo = api._resolve_odoo(ctx, instance)
+        values = _coerce_values(values, values_json)
         if not values:
             raise ValueError("values darf nicht leer sein.")
         rows = odoo.read_records(model, [int(record_id)], fields=["display_name"])

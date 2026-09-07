@@ -37,7 +37,11 @@ from .tool_helpers import (
     validate_method_name,
     validate_model_name,
 )
-from .write_policy import chatter_direct_enabled, side_effect_method_allowed, writes_enabled
+from .write_policy import (
+    chatter_direct_enabled,
+    side_effect_method_allowed,
+    writes_enabled,
+)
 from .rate_limit import check_rate
 from .server_core import (
     DESTRUCTIVE_TOOL,
@@ -129,6 +133,7 @@ def _resolve_binary_from_path_fields(
 def _srv() -> Any:
     """Late import of server module to resolve patchable symbols at call time."""
     from . import server
+
     return server
 
 
@@ -273,7 +278,6 @@ def _coerce_values_json(
     return values, values_list
 
 
-
 @mcp.tool(
     description="Preview create, write, or unlink without executing it",
     annotations=PREVIEW_TOOL,
@@ -363,7 +367,9 @@ def validate_write(
         resolved_binary_values: Dict[str, Any] = {}
         if values:
             values, resolved_binary_values = _resolve_binary_from_path_fields(values)
-        if resolved_binary_values and (fields_metadata is not None or not use_live_metadata):
+        if resolved_binary_values and (
+            fields_metadata is not None or not use_live_metadata
+        ):
             return {
                 "success": False,
                 "tool": "validate_write",
@@ -464,13 +470,27 @@ def validate_write(
 )
 async def execute_approved_write_tool(
     ctx: Context,
-    approval: Dict[str, Any],
+    approval: Optional[Dict[str, Any]] = None,
     confirm: bool = False,
+    approval_json: Optional[Union[str, Dict[str, Any]]] = None,
     review: Annotated[
         ElicitationResult[WriteConfirmation], Resolve(_resolve_write_confirmation)
     ] = _DIRECT_CALL_REVIEW,  # type: ignore[assignment]
 ) -> Dict[str, Any]:
-    """Tool entry point: era-portable human confirmation, then the sync gates."""
+    """Tool entry point: era-portable human confirmation, then the sync gates.
+
+    ``approval_json`` accepts the token as JSON text for the same reason
+    ``preview_write`` and ``validate_write`` accept ``values_json``: models
+    author a free-form object through an ``anyOf`` union unreliably, and the
+    approval token is exactly such an object. Without it the documented
+    three-step write flow ends in a validation error on its final call.
+    """
+    approval = _coerce_approval_json(approval, approval_json)
+    if approval is None:
+        raise ValueError(
+            "approval is required: pass the block returned by validate_write, "
+            "either as approval or as JSON text in approval_json."
+        )
     if review is _DIRECT_CALL_REVIEW:
         # Direct Python callers bypass MCP dependency resolution.
         decision, detail = await _elicit_write_confirmation(ctx, approval)
@@ -871,11 +891,14 @@ def execute_method(
         Optional[List[Any]], Field(description="Optional positional method arguments.")
     ] = None,
     kwargs: Annotated[
-        Optional[Dict[str, Any]], Field(description="Optional keyword method arguments.")
+        Optional[Dict[str, Any]],
+        Field(description="Optional keyword method arguments."),
     ] = None,
     instance: Annotated[
         Optional[str],
-        Field(description="Optional configured Odoo instance name; uses the default if omitted."),
+        Field(
+            description="Optional configured Odoo instance name; uses the default if omitted."
+        ),
     ] = None,
 ) -> Dict[str, Any]:
     """
