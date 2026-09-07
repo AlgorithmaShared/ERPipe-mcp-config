@@ -35,7 +35,7 @@ import re
 import threading
 import time
 from datetime import date, datetime, timedelta, timezone
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Union
 from zoneinfo import ZoneInfo
 
 from mcp.server.mcpserver import Context
@@ -57,7 +57,9 @@ def _eigene_partner_id(odoo: Any) -> Optional[int]:
         partner = rows[0].get("partner_id") if rows else None
         if partner:
             # Odoo liefert many2one als [id, name]
-            return int(partner[0]) if isinstance(partner, (list, tuple)) else int(partner)
+            return (
+                int(partner[0]) if isinstance(partner, (list, tuple)) else int(partner)
+            )
     except Exception:
         return None
     return None
@@ -95,7 +97,9 @@ def chf_schwelle() -> float:
 
 def public_url(odoo: Any) -> str:
     """Browser-facing Odoo URL (PDF links); falls back to the instance URL."""
-    return (os.environ.get("ODOO_PUBLIC_URL") or getattr(odoo, "url", "") or "").rstrip("/")
+    return (os.environ.get("ODOO_PUBLIC_URL") or getattr(odoo, "url", "") or "").rstrip(
+        "/"
+    )
 
 
 # --- time handling ------------------------------------------------------------
@@ -111,7 +115,13 @@ def parse_local_datetime(text: str) -> datetime:
     if not raw:
         raise ValueError("Zeitangabe fehlt.")
     parsed: Optional[datetime] = None
-    for fmt in ("%Y-%m-%d %H:%M:%S%z", "%Y-%m-%d %H:%M%z", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
+    for fmt in (
+        "%Y-%m-%d %H:%M:%S%z",
+        "%Y-%m-%d %H:%M%z",
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%d %H:%M",
+        "%Y-%m-%d",
+    ):
         try:
             parsed = datetime.strptime(raw.replace("Z", "+0000"), fmt)
             break
@@ -131,9 +141,96 @@ def to_odoo_utc(value: datetime) -> str:
     return value.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
 
+def to_odoo_utc_marked(value: datetime) -> str:
+    """UTC datetime that still says so, for values crossing a write helper.
+
+    ``localize_datetime_values`` converts naive strings from local time. A tool
+    that has already converted must therefore hand on a value that carries its
+    offset, or the second pass would shift it again. Odoo accepts the offset
+    form and normalises it, so nothing downstream needs to know.
+    """
+    return value.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S%z")
+
+
 def format_local(value: datetime) -> str:
     local = value.astimezone(_local_tz())
     return local.strftime("%a %d.%m.%Y %H:%M")
+
+
+def _coerce_values(
+    values: Optional[Dict[str, Any]],
+    values_json: Optional[Union[str, Dict[str, Any]]],
+) -> Optional[Dict[str, Any]]:
+    """Accept a write payload as JSON text as well as a real object.
+
+    Same reasoning as ``_coerce_values_json`` in the core write tools: the
+    object parameter becomes an ``anyOf`` union in the tool schema and models
+    author it unreliably - it arrives as ``{}`` often enough that the agent
+    prompt tells the model to always send JSON text instead. The tools that
+    only accepted the object form therefore failed on exactly the calls the
+    prompt instructed.
+    """
+    if values:
+        return values
+    if not values_json:
+        return values
+    if isinstance(values_json, dict):
+        return values_json
+    try:
+        parsed = json.loads(values_json)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"values_json ist kein gueltiges JSON: {exc}") from exc
+    if not isinstance(parsed, dict):
+        raise ValueError("values_json muss ein JSON-Objekt sein.")
+    return parsed
+
+
+# Odoo stores datetimes in UTC and renders them in the reader's timezone. The
+# model speaks the user's local time ("move it to 10:00"), so a naive value
+# handed straight to Odoo is read as UTC and comes back shifted by the offset -
+# in Zurich that is +1h in winter and +2h in summer.
+#
+# termin_buchen converted its own start/stop from the beginning. Every other
+# write path did not, so creating an appointment was correct while moving one
+# silently landed two hours late. Converting here, at the single choke point
+# both gated_create and gated_write pass through, fixes every tool at once and
+# keeps the rule in one place.
+def localize_datetime_values(
+    odoo: Any,
+    model: str,
+    values: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Convert naive datetime strings in ``values`` from local time to UTC.
+
+    Which fields are datetimes is asked of Odoo rather than hardcoded, so this
+    works for ``date_deadline``, ``date_order`` and any custom field without a
+    list to maintain. ``date`` fields are left alone: a calendar day has no
+    timezone and shifting it would move it to the wrong day.
+
+    Values that already carry an offset (``...+02:00``, ``...Z``) are trusted
+    as given. Anything unparseable is passed through untouched so a bad input
+    fails in Odoo with a clear error instead of being silently rewritten.
+    """
+    if not values:
+        return values
+    try:
+        fields = odoo.get_model_fields(model) or {}
+    except Exception:  # noqa: BLE001 - never block a write over field metadata
+        return values
+
+    out = dict(values)
+    for name, value in values.items():
+        spec = fields.get(name) or {}
+        if spec.get("type") != "datetime":
+            continue
+        if not isinstance(value, str) or not value.strip():
+            continue
+        try:
+            parsed = parse_local_datetime(value)
+        except ValueError:
+            continue  # let Odoo reject it with its own message
+        out[name] = to_odoo_utc(parsed)
+    return out
 
 
 # --- confirmation store (identity-bound, single-use, TTL) ---------------------
@@ -152,11 +249,19 @@ def _principal(ctx: Any) -> Optional[str]:
     return None if identity is None else identity.principal
 
 
-def register_pending(ctx: Any, instance_name: str, tool: str, payload: Dict[str, Any]) -> str:
+def register_pending(
+    ctx: Any, instance_name: str, tool: str, payload: Dict[str, Any]
+) -> str:
     """Store a previewed action; returns the code the user's 'ja' unlocks."""
     now = time.time()
     material = json.dumps(
-        {"tool": tool, "instance": instance_name, "principal": _principal(ctx), "payload": payload, "at": now},
+        {
+            "tool": tool,
+            "instance": instance_name,
+            "principal": _principal(ctx),
+            "payload": payload,
+            "at": now,
+        },
         sort_keys=True,
         default=str,
     )
@@ -177,7 +282,9 @@ def register_pending(ctx: Any, instance_name: str, tool: str, payload: Dict[str,
     return code
 
 
-def take_pending(ctx: Any, instance_name: str, tool: str, code: Optional[str]) -> Dict[str, Any]:
+def take_pending(
+    ctx: Any, instance_name: str, tool: str, code: Optional[str]
+) -> Dict[str, Any]:
     """Consume a code: same tool, same instance, same user, unexpired, once.
 
     Models sometimes drop or mangle the code between the card and the "ja".
@@ -191,28 +298,49 @@ def take_pending(ctx: Any, instance_name: str, tool: str, code: Optional[str]) -
     with _PENDING_LOCK:
         now = time.time()
         if code is None or code not in _PENDING:
-            candidates = [key for key, item in _PENDING.items() if item["tool"] == tool and item["instance"] == instance_name and item["binding"] == binding and item["expires_at"] >= now]
+            candidates = [
+                key
+                for key, item in _PENDING.items()
+                if item["tool"] == tool
+                and item["instance"] == instance_name
+                and item["binding"] == binding
+                and item["expires_at"] >= now
+            ]
             if len(candidates) == 1:
                 code = candidates[0]
             elif not candidates:
-                raise ValueError("Keine offene Freigabe fuer diese Aktion - zuerst ohne bestaetigen aufrufen, Karte zeigen, dann bestaetigen.")
+                raise ValueError(
+                    "Keine offene Freigabe fuer diese Aktion - zuerst ohne bestaetigen aufrufen, Karte zeigen, dann bestaetigen."
+                )
             else:
-                raise ValueError("Mehrere offene Freigaben - bitte den freigabe_code aus der zuletzt gezeigten Karte angeben.")
+                raise ValueError(
+                    "Mehrere offene Freigaben - bitte den freigabe_code aus der zuletzt gezeigten Karte angeben."
+                )
         item = _PENDING.get(code)
         if item is None:
-            raise ValueError("Unbekannter oder bereits verwendeter freigabe_code - Vorschau wiederholen.")
+            raise ValueError(
+                "Unbekannter oder bereits verwendeter freigabe_code - Vorschau wiederholen."
+            )
         if item["expires_at"] < time.time():
             _PENDING.pop(code, None)
-            raise ValueError("Der freigabe_code ist abgelaufen (10 Minuten) - Vorschau wiederholen.")
+            raise ValueError(
+                "Der freigabe_code ist abgelaufen (10 Minuten) - Vorschau wiederholen."
+            )
         if item["tool"] != tool or item["instance"] != instance_name:
-            raise ValueError("Der freigabe_code gehoert zu einer anderen Aktion oder Instanz.")
+            raise ValueError(
+                "Der freigabe_code gehoert zu einer anderen Aktion oder Instanz."
+            )
         if item["binding"] != _identity_binding(ctx, instance_name):
-            raise ValueError("Der freigabe_code wurde von einem anderen Benutzer erzeugt - Vorschau als aktueller Benutzer wiederholen.")
+            raise ValueError(
+                "Der freigabe_code wurde von einem anderen Benutzer erzeugt - Vorschau als aktueller Benutzer wiederholen."
+            )
         _PENDING.pop(code, None)
     return dict(item["payload"])
 
 
-def _card(tool: str, aktion: str, details: Dict[str, Any], frage: str, code: str) -> Dict[str, Any]:
+def _card(
+    tool: str, aktion: str, details: Dict[str, Any], frage: str, code: str
+) -> Dict[str, Any]:
     return {
         "success": True,
         "tool": tool,
@@ -281,12 +409,27 @@ def _fail(tool: str, error: Any, **extra: Any) -> Dict[str, Any]:
 # --- gated primitives (all writes pass the core pipeline) ---------------------
 
 
-def gated_create(ctx: Any, model: str, values: Dict[str, Any], *, instance: Optional[str] = None, context: Optional[Dict[str, Any]] = None) -> int:
+def gated_create(
+    ctx: Any,
+    model: str,
+    values: Dict[str, Any],
+    *,
+    instance: Optional[str] = None,
+    context: Optional[Dict[str, Any]] = None,
+) -> int:
     core = _core()
-    report = core.validate_write(ctx, model, "create", values=values, context=context, instance=instance)
-    if not report.get("success") or not (report.get("approval_status") or {}).get("stored"):
+    _, odoo = core._resolve_odoo(ctx, instance)
+    values = localize_datetime_values(odoo, model, values)
+    report = core.validate_write(
+        ctx, model, "create", values=values, context=context, instance=instance
+    )
+    if not report.get("success") or not (report.get("approval_status") or {}).get(
+        "stored"
+    ):
         issues = report.get("issues") or []
-        detail = "; ".join(str(issue.get("message")) for issue in issues if isinstance(issue, dict)) or report.get("error")
+        detail = "; ".join(
+            str(issue.get("message")) for issue in issues if isinstance(issue, dict)
+        ) or report.get("error")
         raise ValueError(f"{model} anlegen abgelehnt: {detail}")
     result = core.execute_approved_write(ctx, report["approval"], confirm=True)
     if not result.get("success"):
@@ -297,57 +440,122 @@ def gated_create(ctx: Any, model: str, values: Dict[str, Any], *, instance: Opti
     return int(created)
 
 
-def gated_write(ctx: Any, model: str, record_ids: List[int], values: Dict[str, Any], *, instance: Optional[str] = None) -> None:
+def gated_write(
+    ctx: Any,
+    model: str,
+    record_ids: List[int],
+    values: Dict[str, Any],
+    *,
+    instance: Optional[str] = None,
+) -> None:
     core = _core()
-    report = core.validate_write(ctx, model, "write", values=values, record_ids=record_ids, instance=instance)
-    if not report.get("success") or not (report.get("approval_status") or {}).get("stored"):
+    _, odoo = core._resolve_odoo(ctx, instance)
+    values = localize_datetime_values(odoo, model, values)
+    report = core.validate_write(
+        ctx, model, "write", values=values, record_ids=record_ids, instance=instance
+    )
+    if not report.get("success") or not (report.get("approval_status") or {}).get(
+        "stored"
+    ):
         issues = report.get("issues") or []
-        detail = "; ".join(str(issue.get("message")) for issue in issues if isinstance(issue, dict)) or report.get("error")
+        detail = "; ".join(
+            str(issue.get("message")) for issue in issues if isinstance(issue, dict)
+        ) or report.get("error")
         raise ValueError(f"{model} aendern abgelehnt: {detail}")
     result = core.execute_approved_write(ctx, report["approval"], confirm=True)
     if not result.get("success"):
         raise ValueError(f"{model} aendern fehlgeschlagen: {result.get('error')}")
 
 
-def gated_unlink(ctx: Any, model: str, record_ids: List[int], *, instance: Optional[str] = None) -> None:
+def gated_unlink(
+    ctx: Any, model: str, record_ids: List[int], *, instance: Optional[str] = None
+) -> None:
     core = _core()
-    report = core.validate_write(ctx, model, "unlink", record_ids=record_ids, instance=instance)
-    if not report.get("success") or not (report.get("approval_status") or {}).get("stored"):
+    report = core.validate_write(
+        ctx, model, "unlink", record_ids=record_ids, instance=instance
+    )
+    if not report.get("success") or not (report.get("approval_status") or {}).get(
+        "stored"
+    ):
         issues = report.get("issues") or []
-        detail = "; ".join(str(issue.get("message")) for issue in issues if isinstance(issue, dict)) or report.get("error")
+        detail = "; ".join(
+            str(issue.get("message")) for issue in issues if isinstance(issue, dict)
+        ) or report.get("error")
         raise ValueError(f"{model} loeschen abgelehnt: {detail}")
     result = core.execute_approved_write(ctx, report["approval"], confirm=True)
     if not result.get("success"):
         raise ValueError(f"{model} loeschen fehlgeschlagen: {result.get('error')}")
 
 
-def gated_method(ctx: Any, model: str, method: str, args: List[Any], kwargs: Optional[Dict[str, Any]] = None, *, instance: Optional[str] = None) -> Any:
+def gated_method(
+    ctx: Any,
+    model: str,
+    method: str,
+    args: List[Any],
+    kwargs: Optional[Dict[str, Any]] = None,
+    *,
+    instance: Optional[str] = None,
+) -> Any:
     """Side-effect methods go through execute_method and its policy allowlist."""
-    result = _core().execute_method(ctx, model, method, args=args, kwargs=kwargs, instance=instance)
+    result = _core().execute_method(
+        ctx, model, method, args=args, kwargs=kwargs, instance=instance
+    )
     if not result.get("success"):
         raise ValueError(f"{model}.{method} nicht ausgefuehrt: {result.get('error')}")
     return result.get("result")
 
 
-def find_or_create(ctx: Any, odoo: Any, model: str, domain: List[Any], values: Dict[str, Any], *, instance: Optional[str] = None) -> int:
+def find_or_create(
+    ctx: Any,
+    odoo: Any,
+    model: str,
+    domain: List[Any],
+    values: Dict[str, Any],
+    *,
+    instance: Optional[str] = None,
+) -> int:
     rows = odoo.search_read(model, domain, fields=["id"], limit=1)
     if rows:
         return int(rows[0]["id"])
     return gated_create(ctx, model, values, instance=instance)
 
 
-def fsm_person_id(ctx: Any, odoo: Any, name: str, *, instance: Optional[str] = None) -> int:
+def fsm_person_id(
+    ctx: Any, odoo: Any, name: str, *, instance: Optional[str] = None
+) -> int:
     """fsm.person for a technician name; created if missing (see old MCP note)."""
     rows = odoo.search_read("fsm.person", [["name", "=", name]], fields=["id"], limit=1)
     if rows:
         return int(rows[0]["id"])
-    partner_id = find_or_create(ctx, odoo, "res.partner", [["name", "=", name]], {"name": name}, instance=instance)
-    return find_or_create(ctx, odoo, "fsm.person", [["partner_id", "=", partner_id]], {"partner_id": partner_id}, instance=instance)
+    partner_id = find_or_create(
+        ctx,
+        odoo,
+        "res.partner",
+        [["name", "=", name]],
+        {"name": name},
+        instance=instance,
+    )
+    return find_or_create(
+        ctx,
+        odoo,
+        "fsm.person",
+        [["partner_id", "=", partner_id]],
+        {"partner_id": partner_id},
+        instance=instance,
+    )
 
 
 # --- tools -----------------------------------------------------------------------
 
-WEEKDAYS_DE = ["Montag", "Dienstag", "Mittwoch", "Donnerstag", "Freitag", "Samstag", "Sonntag"]
+WEEKDAYS_DE = [
+    "Montag",
+    "Dienstag",
+    "Mittwoch",
+    "Donnerstag",
+    "Freitag",
+    "Samstag",
+    "Sonntag",
+]
 
 
 def aktuelles_datum(ctx: Context) -> Dict[str, Any]:
@@ -359,9 +567,14 @@ def aktuelles_datum(ctx: Context) -> Dict[str, Any]:
     tool = "aktuelles_datum"
     try:
         now = datetime.now(_local_tz())
+
         def day(offset: int) -> Dict[str, str]:
             d = now + timedelta(days=offset)
-            return {"datum": d.strftime("%Y-%m-%d"), "wochentag": WEEKDAYS_DE[d.weekday()]}
+            return {
+                "datum": d.strftime("%Y-%m-%d"),
+                "wochentag": WEEKDAYS_DE[d.weekday()],
+            }
+
         return {
             "success": True,
             "tool": tool,
@@ -405,8 +618,8 @@ def termin_buchen(
             raise ValueError("stop muss nach start liegen.")
         values: Dict[str, Any] = {
             "name": titel.strip(),
-            "start": to_odoo_utc(begin),
-            "stop": to_odoo_utc(end),
+            "start": to_odoo_utc_marked(begin),
+            "stop": to_odoo_utc_marked(end),
             "allday": False,
         }
         if beschreibung:
@@ -431,16 +644,20 @@ def termin_buchen(
             "von": format_local(begin),
             "bis": format_local(end),
             "zeitzone": str(_local_tz().key),
-            "odoo_utc": {"start": values["start"], "stop": values["stop"]},
+            "odoo_utc": {"start": to_odoo_utc(begin), "stop": to_odoo_utc(end)},
         }
         if not bestaetigen:
-            report = api.validate_write(ctx, "calendar.event", "create", values=values, instance=instance_name)
+            report = api.validate_write(
+                ctx, "calendar.event", "create", values=values, instance=instance_name
+            )
             if not report.get("success"):
                 # Pass the core's reason through: a missing model (module not
                 # installed) must not read like invalid input.
                 reason = report.get("error") or "Termin-Daten ungueltig"
                 return _fail(tool, reason, issues=report.get("issues"), details=anzeige)
-            code = register_pending(ctx, instance_name, tool, {"values": values, "anzeige": anzeige})
+            code = register_pending(
+                ctx, instance_name, tool, {"values": values, "anzeige": anzeige}
+            )
             return _card(
                 tool,
                 "Termin ANLEGEN",
@@ -449,7 +666,9 @@ def termin_buchen(
                 code,
             )
         payload = take_pending(ctx, instance_name, tool, freigabe_code)
-        event_id = gated_create(ctx, "calendar.event", payload["values"], instance=instance_name)
+        event_id = gated_create(
+            ctx, "calendar.event", payload["values"], instance=instance_name
+        )
         shown = payload["anzeige"]
         return {
             "success": True,
@@ -493,22 +712,50 @@ def create_partner(
             values["customer_rank"] = 1
         elif art == "lieferant" and "supplier_rank" in partner_fields:
             values["supplier_rank"] = 1
-        for key, value in (("email", email), ("phone", phone), ("street", street), ("city", city), ("zip", zip)):
+        for key, value in (
+            ("email", email),
+            ("phone", phone),
+            ("street", street),
+            ("city", city),
+            ("zip", zip),
+        ):
             if value:
                 values[key] = value
         if not bestaetigen:
-            existing = odoo.search_read("res.partner", [["name", "=", values["name"]]], fields=["id", "email", "city"], limit=3)
-            report = api.validate_write(ctx, "res.partner", "create", values=values, instance=instance_name)
+            existing = odoo.search_read(
+                "res.partner",
+                [["name", "=", values["name"]]],
+                fields=["id", "email", "city"],
+                limit=3,
+            )
+            report = api.validate_write(
+                ctx, "res.partner", "create", values=values, instance=instance_name
+            )
             if not report.get("success"):
-                return _fail(tool, "Kontakt-Daten ungueltig", issues=report.get("issues"))
+                return _fail(
+                    tool, "Kontakt-Daten ungueltig", issues=report.get("issues")
+                )
             code = register_pending(ctx, instance_name, tool, {"values": values})
             details = dict(values)
             if existing:
                 details["hinweis_bestehende"] = existing
-            return _card(tool, "Kontakt ANLEGEN", details, f"Kontakt '{values['name']}' ({art}) anlegen?", code)
+            return _card(
+                tool,
+                "Kontakt ANLEGEN",
+                details,
+                f"Kontakt '{values['name']}' ({art}) anlegen?",
+                code,
+            )
         payload = take_pending(ctx, instance_name, tool, freigabe_code)
-        partner_id = gated_create(ctx, "res.partner", payload["values"], instance=instance_name)
-        return {"success": True, "tool": tool, "partner_id": partner_id, "summary": f"Kontakt '{payload['values']['name']}' angelegt (ID {partner_id})."}
+        partner_id = gated_create(
+            ctx, "res.partner", payload["values"], instance=instance_name
+        )
+        return {
+            "success": True,
+            "tool": tool,
+            "partner_id": partner_id,
+            "summary": f"Kontakt '{payload['values']['name']}' angelegt (ID {partner_id}).",
+        }
     except Exception as exc:  # noqa: BLE001
         return _fail(tool, exc)
 
@@ -543,40 +790,84 @@ def notiz_hinterlassen(
             rows = odoo.read_records(model, [int(record_id)], fields=["display_name"])
             if not rows:
                 raise ValueError(f"{model} #{record_id} gibt es nicht.")
-            code = register_pending(ctx, instance_name, tool, {
-                "model": model, "record_id": int(record_id), "notiz": text, "message_type": message_type,
-            })
+            code = register_pending(
+                ctx,
+                instance_name,
+                tool,
+                {
+                    "model": model,
+                    "record_id": int(record_id),
+                    "notiz": text,
+                    "message_type": message_type,
+                },
+            )
             return _card(
-                tool, "Notiz hinterlassen",
-                {"datensatz": rows[0].get("display_name"), "model": model, "id": int(record_id), "notiz": text},
+                tool,
+                "Notiz hinterlassen",
+                {
+                    "datensatz": rows[0].get("display_name"),
+                    "model": model,
+                    "id": int(record_id),
+                    "notiz": text,
+                },
                 f"Notiz '{text}' bei {rows[0].get('display_name')} hinterlassen?",
                 code,
             )
         payload = take_pending(ctx, instance_name, tool, freigabe_code)
         result = gated_method(
-            ctx, payload["model"], "message_post", [[payload["record_id"]]],
+            ctx,
+            payload["model"],
+            "message_post",
+            [[payload["record_id"]]],
             kwargs={"body": payload["notiz"], "message_type": payload["message_type"]},
             instance=instance_name,
         )
-        return {"success": True, "tool": tool, "result": result, "summary": "Notiz hinterlassen."}
+        return {
+            "success": True,
+            "tool": tool,
+            "result": result,
+            "summary": "Notiz hinterlassen.",
+        }
     except Exception as exc:  # noqa: BLE001
         return _fail(tool, exc)
 
 
-def get_account_by_code(ctx: Context, code: str, instance: Optional[str] = None) -> Dict[str, Any]:
+def get_account_by_code(
+    ctx: Context, code: str, instance: Optional[str] = None
+) -> Dict[str, Any]:
     """Schlaegt Konten im Schweizer KMU-Kontenrahmen nach (z.B. '1020', '3000'). Nur lesen."""
     tool = "get_account_by_code"
     try:
         api = _core()
         instance_name, odoo = api._resolve_odoo(ctx, instance)
-        rows = odoo.search_read("account.account", [["code", "=like", str(code).strip() + "%"]], fields=["code", "name", "account_type"], limit=10)
-        rows, redacted = api.get_field_policy().redact_records(instance_name, "account.account", list(rows))
-        return {"success": True, "tool": tool, "model": "account.account", "count": len(rows), "result": rows, "redacted_fields": redacted}
+        rows = odoo.search_read(
+            "account.account",
+            [["code", "=like", str(code).strip() + "%"]],
+            fields=["code", "name", "account_type"],
+            limit=10,
+        )
+        rows, redacted = api.get_field_policy().redact_records(
+            instance_name, "account.account", list(rows)
+        )
+        return {
+            "success": True,
+            "tool": tool,
+            "model": "account.account",
+            "count": len(rows),
+            "result": rows,
+            "redacted_fields": redacted,
+        }
     except Exception as exc:  # noqa: BLE001
         return _fail(tool, exc)
 
 
-def bericht_link(ctx: Context, model: str, record_id: int, report_name: Optional[str] = None, instance: Optional[str] = None) -> Dict[str, Any]:
+def bericht_link(
+    ctx: Context,
+    model: str,
+    record_id: int,
+    report_name: Optional[str] = None,
+    instance: Optional[str] = None,
+) -> Dict[str, Any]:
     """Liefert die Adresse des PDF-Berichts zu einem Datensatz (nur den Link, keine Datei).
 
     Beispiel Einsatzrapport: model="fsm.order", record_id=3. Ohne report_name: erster PDF-Bericht.
@@ -586,16 +877,35 @@ def bericht_link(ctx: Context, model: str, record_id: int, report_name: Optional
         api = _core()
         api.validate_model_name(model)
         instance_name, odoo = api._resolve_odoo(ctx, instance)
-        rows = odoo.search_read(model, [["id", "=", int(record_id)]], fields=["display_name"], limit=1)
+        rows = odoo.search_read(
+            model, [["id", "=", int(record_id)]], fields=["display_name"], limit=1
+        )
         if not rows:
-            raise ValueError(f"Kein Datensatz {record_id} in '{model}' gefunden - oder keine Leseberechtigung.")
-        reports = odoo.search_read("ir.actions.report", [["model", "=", model], ["report_type", "=", "qweb-pdf"]], fields=["report_name", "name"], limit=5)
+            raise ValueError(
+                f"Kein Datensatz {record_id} in '{model}' gefunden - oder keine Leseberechtigung."
+            )
+        reports = odoo.search_read(
+            "ir.actions.report",
+            [["model", "=", model], ["report_type", "=", "qweb-pdf"]],
+            fields=["report_name", "name"],
+            limit=5,
+        )
         if not reports:
             raise ValueError(f"Fuer '{model}' ist kein PDF-Bericht hinterlegt.")
         if report_name:
-            chosen = next((r for r in reports if r["report_name"] == report_name or r["name"] == report_name), None)
+            chosen = next(
+                (
+                    r
+                    for r in reports
+                    if r["report_name"] == report_name or r["name"] == report_name
+                ),
+                None,
+            )
             if chosen is None:
-                raise ValueError(f"Kein PDF-Bericht '{report_name}' fuer '{model}'. Verfuegbar: " + ", ".join(r["name"] for r in reports))
+                raise ValueError(
+                    f"Kein PDF-Bericht '{report_name}' fuer '{model}'. Verfuegbar: "
+                    + ", ".join(r["name"] for r in reports)
+                )
         else:
             chosen = reports[0]
         others = [r["name"] for r in reports if r is not chosen]
@@ -629,23 +939,52 @@ def auftrag_monteur_zuweisen(
     try:
         api = _core()
         instance_name, odoo = api._resolve_odoo(ctx, instance)
-        rows = odoo.read_records("fsm.order", [int(order_id)], fields=["name", "person_id"])
+        rows = odoo.read_records(
+            "fsm.order", [int(order_id)], fields=["name", "person_id"]
+        )
         if not rows:
             raise ValueError(f"Auftrag #{order_id} gibt es nicht.")
         current = rows[0].get("person_id")
         if not bestaetigen:
-            code = register_pending(ctx, instance_name, tool, {"order_id": int(order_id), "monteur": monteur, "auftrag": rows[0].get("name")})
+            code = register_pending(
+                ctx,
+                instance_name,
+                tool,
+                {
+                    "order_id": int(order_id),
+                    "monteur": monteur,
+                    "auftrag": rows[0].get("name"),
+                },
+            )
             return _card(
                 tool,
                 "Monteur ZUTEILEN",
-                {"auftrag": rows[0].get("name"), "id": int(order_id), "vorher": current[1] if current else "keine Zuteilung", "nachher": monteur},
+                {
+                    "auftrag": rows[0].get("name"),
+                    "id": int(order_id),
+                    "vorher": current[1] if current else "keine Zuteilung",
+                    "nachher": monteur,
+                },
                 f"Soll {monteur} dem Auftrag {rows[0].get('name')} zugeteilt werden?",
                 code,
             )
         payload = take_pending(ctx, instance_name, tool, freigabe_code)
         person_id = fsm_person_id(ctx, odoo, payload["monteur"], instance=instance_name)
-        gated_write(ctx, "fsm.order", [payload["order_id"]], {"person_id": person_id, "person_ids": [[4, person_id]]}, instance=instance_name)
-        return {"success": True, "tool": tool, "auftrag": payload["auftrag"], "auftrag_id": payload["order_id"], "person_id": person_id, "summary": f"{payload['monteur']} ist dem Auftrag {payload['auftrag']} zugeteilt."}
+        gated_write(
+            ctx,
+            "fsm.order",
+            [payload["order_id"]],
+            {"person_id": person_id, "person_ids": [[4, person_id]]},
+            instance=instance_name,
+        )
+        return {
+            "success": True,
+            "tool": tool,
+            "auftrag": payload["auftrag"],
+            "auftrag_id": payload["order_id"],
+            "person_id": person_id,
+            "summary": f"{payload['monteur']} ist dem Auftrag {payload['auftrag']} zugeteilt.",
+        }
     except Exception as exc:  # noqa: BLE001
         return _fail(tool, exc)
 
@@ -662,31 +1001,63 @@ def auftrag_abschliessen(
     try:
         api = _core()
         instance_name, odoo = api._resolve_odoo(ctx, instance)
-        rows = odoo.read_records("fsm.order", [int(order_id)], fields=["name", "stage_id"])
+        rows = odoo.read_records(
+            "fsm.order", [int(order_id)], fields=["name", "stage_id"]
+        )
         if not rows:
             raise ValueError(f"Auftrag #{order_id} gibt es nicht.")
         stage = rows[0].get("stage_id")
         if not bestaetigen:
-            code = register_pending(ctx, instance_name, tool, {"order_id": int(order_id), "auftrag": rows[0].get("name")})
+            code = register_pending(
+                ctx,
+                instance_name,
+                tool,
+                {"order_id": int(order_id), "auftrag": rows[0].get("name")},
+            )
             return _card(
                 tool,
                 "Auftrag ABSCHLIESSEN",
-                {"auftrag": rows[0].get("name"), "id": int(order_id), "stufe_vorher": stage[1] if stage else "-", "stufe_nachher": "Completed"},
+                {
+                    "auftrag": rows[0].get("name"),
+                    "id": int(order_id),
+                    "stufe_vorher": stage[1] if stage else "-",
+                    "stufe_nachher": "Completed",
+                },
                 f"Soll der Auftrag {rows[0].get('name')} abgeschlossen werden?",
                 code,
             )
         payload = take_pending(ctx, instance_name, tool, freigabe_code)
-        gated_method(ctx, "fsm.order", "action_complete", [[payload["order_id"]]], instance=instance_name)
-        after = odoo.read_records("fsm.order", [payload["order_id"]], fields=["stage_id"])
+        gated_method(
+            ctx,
+            "fsm.order",
+            "action_complete",
+            [[payload["order_id"]]],
+            instance=instance_name,
+        )
+        after = odoo.read_records(
+            "fsm.order", [payload["order_id"]], fields=["stage_id"]
+        )
         new_stage = after[0].get("stage_id") if after else None
-        return {"success": True, "tool": tool, "auftrag": payload["auftrag"], "auftrag_id": payload["order_id"], "stufe": new_stage[1] if new_stage else "?", "summary": f"Auftrag {payload['auftrag']} ist abgeschlossen."}
+        return {
+            "success": True,
+            "tool": tool,
+            "auftrag": payload["auftrag"],
+            "auftrag_id": payload["order_id"],
+            "stufe": new_stage[1] if new_stage else "?",
+            "summary": f"Auftrag {payload['auftrag']} ist abgeschlossen.",
+        }
     except Exception as exc:  # noqa: BLE001
         return _fail(tool, exc)
 
 
 def _find_tax_id(odoo: Any, percent: float, move_type: str) -> Optional[int]:
     use = "sale" if move_type in ("out_invoice", "out_refund") else "purchase"
-    rows = odoo.search_read("account.tax", [["type_tax_use", "=", use], ["amount", "=", percent], ["active", "=", True]], fields=["id"], limit=1)
+    rows = odoo.search_read(
+        "account.tax",
+        [["type_tax_use", "=", use], ["amount", "=", percent], ["active", "=", True]],
+        fields=["id"],
+        limit=1,
+    )
     return int(rows[0]["id"]) if rows else None
 
 
@@ -711,7 +1082,9 @@ def create_invoice(
         api = _core()
         instance_name, odoo = api._resolve_odoo(ctx, instance)
         if move_type not in ("out_invoice", "in_invoice", "out_refund"):
-            raise ValueError("move_type muss out_invoice, in_invoice oder out_refund sein.")
+            raise ValueError(
+                "move_type muss out_invoice, in_invoice oder out_refund sein."
+            )
         if not lines:
             raise ValueError("Mindestens eine Rechnungszeile noetig.")
         total = 0.0
@@ -722,10 +1095,19 @@ def create_invoice(
             qty = float(line.get("quantity", 1) or 1)
             price = float(line.get("price_unit", 0) or 0)
             total += qty * price
-            lvals: Dict[str, Any] = {"name": str(line.get("description", "Position")), "quantity": qty, "price_unit": price}
+            lvals: Dict[str, Any] = {
+                "name": str(line.get("description", "Position")),
+                "quantity": qty,
+                "price_unit": price,
+            }
             code = line.get("account_code")
             if code:
-                acc = odoo.search_read("account.account", [["code", "=like", str(code) + "%"]], fields=["id"], limit=1)
+                acc = odoo.search_read(
+                    "account.account",
+                    [["code", "=like", str(code) + "%"]],
+                    fields=["id"],
+                    limit=1,
+                )
                 if acc:
                     lvals["account_id"] = int(acc[0]["id"])
             percent = line.get("tax_percent")
@@ -737,7 +1119,9 @@ def create_invoice(
                     lvals["tax_ids"] = [[6, 0, [tax_cache[percent]]]]
                     tax_notes.add(f"{percent}% MWST")
                 else:
-                    tax_notes.add(f"ACHTUNG: kein {percent}%-Steuersatz in Odoo gefunden - Zeile OHNE MwSt")
+                    tax_notes.add(
+                        f"ACHTUNG: kein {percent}%-Steuersatz in Odoo gefunden - Zeile OHNE MwSt"
+                    )
             else:
                 lvals["tax_ids"] = [[6, 0, []]]
                 tax_notes.add("ohne MwSt (explizit)")
@@ -753,19 +1137,53 @@ def create_invoice(
         }
         move_context = {"default_move_type": move_type}
         if not bestaetigen:
-            code = register_pending(ctx, instance_name, tool, {"values": values, "context": move_context, "partner": partner_name, "total": round(total, 2), "mwst": sorted(tax_notes)})
+            code = register_pending(
+                ctx,
+                instance_name,
+                tool,
+                {
+                    "values": values,
+                    "context": move_context,
+                    "partner": partner_name,
+                    "total": round(total, 2),
+                    "mwst": sorted(tax_notes),
+                },
+            )
             return _card(
                 tool,
                 "Rechnung erstellen (Entwurf)",
-                {"partner": partner_name, "betrag_chf": round(total, 2), "zeilen": len(invoice_lines), "mwst": sorted(tax_notes), "schwelle_chf": chf_schwelle(), "ueber_schwelle": total > chf_schwelle()},
+                {
+                    "partner": partner_name,
+                    "betrag_chf": round(total, 2),
+                    "zeilen": len(invoice_lines),
+                    "mwst": sorted(tax_notes),
+                    "schwelle_chf": chf_schwelle(),
+                    "ueber_schwelle": total > chf_schwelle(),
+                },
                 f"Rechnung ueber CHF {total:,.2f} an {partner_name} als Entwurf anlegen?",
                 code,
             )
         payload = take_pending(ctx, instance_name, tool, freigabe_code)
-        move_id = gated_create(ctx, "account.move", payload["values"], instance=instance_name, context=payload.get("context"))
-        info = odoo.read_records("account.move", [move_id], fields=["name", "state", "amount_total"])
-        info0 = info[0] if info else {"name": "/", "state": "draft", "amount_total": payload["total"]}
-        label = info0["name"] if info0.get("name") and info0["name"] != "/" else f"#{move_id}"
+        move_id = gated_create(
+            ctx,
+            "account.move",
+            payload["values"],
+            instance=instance_name,
+            context=payload.get("context"),
+        )
+        info = odoo.read_records(
+            "account.move", [move_id], fields=["name", "state", "amount_total"]
+        )
+        info0 = (
+            info[0]
+            if info
+            else {"name": "/", "state": "draft", "amount_total": payload["total"]}
+        )
+        label = (
+            info0["name"]
+            if info0.get("name") and info0["name"] != "/"
+            else f"#{move_id}"
+        )
         return {
             "success": True,
             "tool": tool,
@@ -799,15 +1217,30 @@ def create_project(
             raise ValueError("name darf nicht leer sein.")
         values = {"name": project_name}
         if not bestaetigen:
-            existing = odoo.search_read("project.project", [["name", "=", project_name]], fields=["id"], limit=3)
+            existing = odoo.search_read(
+                "project.project", [["name", "=", project_name]], fields=["id"], limit=3
+            )
             code = register_pending(ctx, instance_name, tool, {"values": values})
             details: Dict[str, Any] = {"name": project_name}
             if existing:
                 details["hinweis_bestehende"] = existing
-            return _card(tool, "Projekt ANLEGEN", details, f"Projekt '{project_name}' anlegen?", code)
+            return _card(
+                tool,
+                "Projekt ANLEGEN",
+                details,
+                f"Projekt '{project_name}' anlegen?",
+                code,
+            )
         payload = take_pending(ctx, instance_name, tool, freigabe_code)
-        project_id = gated_create(ctx, "project.project", payload["values"], instance=instance_name)
-        return {"success": True, "tool": tool, "project_id": project_id, "summary": f"Projekt '{payload['values']['name']}' angelegt (ID {project_id})."}
+        project_id = gated_create(
+            ctx, "project.project", payload["values"], instance=instance_name
+        )
+        return {
+            "success": True,
+            "tool": tool,
+            "project_id": project_id,
+            "summary": f"Projekt '{payload['values']['name']}' angelegt (ID {project_id}).",
+        }
     except Exception as exc:  # noqa: BLE001
         return _fail(tool, exc)
 
@@ -837,31 +1270,59 @@ def create_task(
             resolved_project_id = project_id
             resolved_project_name = None
             if resolved_project_id:
-                rows = odoo.read_records("project.project", [int(resolved_project_id)], fields=["name"])
+                rows = odoo.read_records(
+                    "project.project", [int(resolved_project_id)], fields=["name"]
+                )
                 if not rows:
                     raise ValueError(f"Projekt #{resolved_project_id} gibt es nicht.")
                 resolved_project_name = rows[0].get("name")
             elif project_name:
-                rows = odoo.search_read("project.project", [["name", "=", project_name.strip()]], fields=["id", "name"], limit=5)
+                rows = odoo.search_read(
+                    "project.project",
+                    [["name", "=", project_name.strip()]],
+                    fields=["id", "name"],
+                    limit=5,
+                )
                 if not rows:
-                    raise ValueError(f"Kein Projekt mit dem Namen '{project_name}' gefunden.")
+                    raise ValueError(
+                        f"Kein Projekt mit dem Namen '{project_name}' gefunden."
+                    )
                 if len(rows) > 1:
-                    raise ValueError(f"Mehrere Projekte mit dem Namen '{project_name}' gefunden (IDs {[r['id'] for r in rows]}) - bitte project_id angeben.")
+                    raise ValueError(
+                        f"Mehrere Projekte mit dem Namen '{project_name}' gefunden (IDs {[r['id'] for r in rows]}) - bitte project_id angeben."
+                    )
                 resolved_project_id = int(rows[0]["id"])
                 resolved_project_name = rows[0].get("name")
             else:
                 raise ValueError("project_id oder project_name muss angegeben werden.")
             values = {"name": task_title, "project_id": resolved_project_id}
-            code = register_pending(ctx, instance_name, tool, {"values": values, "projekt": resolved_project_name})
+            code = register_pending(
+                ctx,
+                instance_name,
+                tool,
+                {"values": values, "projekt": resolved_project_name},
+            )
             return _card(
-                tool, "Aufgabe ANLEGEN",
-                {"titel": task_title, "projekt": resolved_project_name, "projekt_id": resolved_project_id},
+                tool,
+                "Aufgabe ANLEGEN",
+                {
+                    "titel": task_title,
+                    "projekt": resolved_project_name,
+                    "projekt_id": resolved_project_id,
+                },
                 f"Aufgabe '{task_title}' im Projekt '{resolved_project_name}' anlegen?",
                 code,
             )
         payload = take_pending(ctx, instance_name, tool, freigabe_code)
-        task_id = gated_create(ctx, "project.task", payload["values"], instance=instance_name)
-        return {"success": True, "tool": tool, "task_id": task_id, "summary": f"Aufgabe '{payload['values']['name']}' im Projekt '{payload['projekt']}' angelegt (ID {task_id})."}
+        task_id = gated_create(
+            ctx, "project.task", payload["values"], instance=instance_name
+        )
+        return {
+            "success": True,
+            "tool": tool,
+            "task_id": task_id,
+            "summary": f"Aufgabe '{payload['values']['name']}' im Projekt '{payload['projekt']}' angelegt (ID {task_id}).",
+        }
     except Exception as exc:  # noqa: BLE001
         return _fail(tool, exc)
 
@@ -894,7 +1355,11 @@ def create_quotation(
             qty = float(line.get("quantity", 1) or 1)
             price = float(line.get("price_unit", 0) or 0)
             total += qty * price
-            lvals: Dict[str, Any] = {"name": str(line.get("description", "Position")), "product_uom_qty": qty, "price_unit": price}
+            lvals: Dict[str, Any] = {
+                "name": str(line.get("description", "Position")),
+                "product_uom_qty": qty,
+                "price_unit": price,
+            }
             percent = line.get("tax_percent")
             percent = 8.1 if percent is None else float(percent)
             if percent > 0:
@@ -904,7 +1369,9 @@ def create_quotation(
                     lvals["tax_id"] = [[6, 0, [tax_cache[percent]]]]
                     tax_notes.add(f"{percent}% MWST")
                 else:
-                    tax_notes.add(f"ACHTUNG: kein {percent}%-Steuersatz in Odoo gefunden - Zeile OHNE MwSt")
+                    tax_notes.add(
+                        f"ACHTUNG: kein {percent}%-Steuersatz in Odoo gefunden - Zeile OHNE MwSt"
+                    )
             else:
                 lvals["tax_id"] = [[6, 0, []]]
                 tax_notes.add("ohne MwSt (explizit)")
@@ -913,18 +1380,41 @@ def create_quotation(
         partner_name = partner[0]["name"] if partner else f"ID {partner_id}"
         values = {"partner_id": int(partner_id), "order_line": order_lines}
         if not bestaetigen:
-            code = register_pending(ctx, instance_name, tool, {"values": values, "partner": partner_name, "total": round(total, 2), "mwst": sorted(tax_notes)})
+            code = register_pending(
+                ctx,
+                instance_name,
+                tool,
+                {
+                    "values": values,
+                    "partner": partner_name,
+                    "total": round(total, 2),
+                    "mwst": sorted(tax_notes),
+                },
+            )
             return _card(
                 tool,
                 "Offerte erstellen (Entwurf)",
-                {"partner": partner_name, "betrag_chf": round(total, 2), "zeilen": len(order_lines), "mwst": sorted(tax_notes)},
+                {
+                    "partner": partner_name,
+                    "betrag_chf": round(total, 2),
+                    "zeilen": len(order_lines),
+                    "mwst": sorted(tax_notes),
+                },
                 f"Offerte ueber CHF {total:,.2f} an {partner_name} als Entwurf anlegen?",
                 code,
             )
         payload = take_pending(ctx, instance_name, tool, freigabe_code)
-        order_id = gated_create(ctx, "sale.order", payload["values"], instance=instance_name)
-        info = odoo.read_records("sale.order", [order_id], fields=["name", "amount_total"])
-        info0 = info[0] if info else {"name": f"#{order_id}", "amount_total": payload["total"]}
+        order_id = gated_create(
+            ctx, "sale.order", payload["values"], instance=instance_name
+        )
+        info = odoo.read_records(
+            "sale.order", [order_id], fields=["name", "amount_total"]
+        )
+        info0 = (
+            info[0]
+            if info
+            else {"name": f"#{order_id}", "amount_total": payload["total"]}
+        )
         return {
             "success": True,
             "tool": tool,
@@ -941,10 +1431,11 @@ def update_record(
     ctx: Context,
     model: str,
     record_id: int,
-    values: Dict[str, Any],
+    values: Optional[Dict[str, Any]] = None,
     bestaetigen: bool = False,
     freigabe_code: Optional[str] = None,
     instance: Optional[str] = None,
+    values_json: Optional[Union[str, Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     """Aendert Feldwerte eines bestehenden Datensatzes (beliebiges Modell).
 
@@ -956,11 +1447,20 @@ def update_record(
     z.B. [[4, ID]] zum Hinzufuegen, [[3, ID]] zum Entfernen, [[6, 0, [IDs]]]
     zum Ersetzen. Erster Aufruf zeigt die Karte, zweiter Aufruf mit
     bestaetigen=true + freigabe_code schreibt.
+
+    Zeiten immer in lokaler Zeit uebergeben (z.B. "2026-09-09 10:00"); die
+    Umrechnung nach UTC uebernimmt das Werkzeug.
+
+    ``values_json`` nimmt dieselben Werte als JSON-Text entgegen - aus dem
+    gleichen Grund wie bei ``preview_write``/``validate_write``: das
+    Objektfeld kommt aus dem Chat regelmaessig leer an, ein String kommt
+    zuverlaessig an.
     """
     tool = "update_record"
     try:
         api = _core()
         instance_name, odoo = api._resolve_odoo(ctx, instance)
+        values = _coerce_values(values, values_json)
         if not values:
             raise ValueError("values darf nicht leer sein.")
         rows = odoo.read_records(model, [int(record_id)], fields=["display_name"])
@@ -968,16 +1468,44 @@ def update_record(
             raise ValueError(f"{model} #{record_id} gibt es nicht.")
         label = rows[0].get("display_name") or f"#{record_id}"
         if not bestaetigen:
-            code = register_pending(ctx, instance_name, tool, {"model": model, "record_id": int(record_id), "values": values, "label": label})
+            code = register_pending(
+                ctx,
+                instance_name,
+                tool,
+                {
+                    "model": model,
+                    "record_id": int(record_id),
+                    "values": values,
+                    "label": label,
+                },
+            )
             return _card(
-                tool, "Datensatz AENDERN",
-                {"datensatz": label, "model": model, "id": int(record_id), "neue_werte": values},
+                tool,
+                "Datensatz AENDERN",
+                {
+                    "datensatz": label,
+                    "model": model,
+                    "id": int(record_id),
+                    "neue_werte": values,
+                },
                 f"'{label}' ({model}) mit diesen Werten aendern: {values}?",
                 code,
             )
         payload = take_pending(ctx, instance_name, tool, freigabe_code)
-        gated_write(ctx, payload["model"], [payload["record_id"]], payload["values"], instance=instance_name)
-        return {"success": True, "tool": tool, "model": payload["model"], "record_id": payload["record_id"], "summary": f"'{payload['label']}' ({payload['model']}) aktualisiert."}
+        gated_write(
+            ctx,
+            payload["model"],
+            [payload["record_id"]],
+            payload["values"],
+            instance=instance_name,
+        )
+        return {
+            "success": True,
+            "tool": tool,
+            "model": payload["model"],
+            "record_id": payload["record_id"],
+            "summary": f"'{payload['label']}' ({payload['model']}) aktualisiert.",
+        }
     except Exception as exc:  # noqa: BLE001
         return _fail(tool, exc)
 
@@ -1005,79 +1533,178 @@ def delete_record(
             raise ValueError(f"{model} #{record_id} gibt es nicht.")
         label = rows[0].get("display_name") or f"#{record_id}"
         if not bestaetigen:
-            code = register_pending(ctx, instance_name, tool, {"model": model, "record_id": int(record_id), "label": label})
+            code = register_pending(
+                ctx,
+                instance_name,
+                tool,
+                {"model": model, "record_id": int(record_id), "label": label},
+            )
             return _card(
-                tool, "Datensatz LOESCHEN",
+                tool,
+                "Datensatz LOESCHEN",
                 {"datensatz": label, "model": model, "id": int(record_id)},
                 f"'{label}' ({model}) UNWIDERRUFLICH loeschen?",
                 code,
             )
         payload = take_pending(ctx, instance_name, tool, freigabe_code)
-        gated_unlink(ctx, payload["model"], [payload["record_id"]], instance=instance_name)
-        return {"success": True, "tool": tool, "model": payload["model"], "record_id": payload["record_id"], "summary": f"'{payload['label']}' ({payload['model']}) geloescht."}
+        gated_unlink(
+            ctx, payload["model"], [payload["record_id"]], instance=instance_name
+        )
+        return {
+            "success": True,
+            "tool": tool,
+            "model": payload["model"],
+            "record_id": payload["record_id"],
+            "summary": f"'{payload['label']}' ({payload['model']}) geloescht.",
+        }
     except Exception as exc:  # noqa: BLE001
         return _fail(tool, exc)
 
 
-def post_journal_entry(ctx: Context, move_id: int, bestaetigen: bool = False, freigabe_code: Optional[str] = None, instance: Optional[str] = None) -> Dict[str, Any]:
+def post_journal_entry(
+    ctx: Context,
+    move_id: int,
+    bestaetigen: bool = False,
+    freigabe_code: Optional[str] = None,
+    instance: Optional[str] = None,
+) -> Dict[str, Any]:
     """Bucht einen Beleg (Entwurf -> gebucht) ueber account.move.action_post. Immer mit Karte."""
     tool = "post_journal_entry"
     try:
         api = _core()
         instance_name, odoo = api._resolve_odoo(ctx, instance)
-        rows = odoo.read_records("account.move", [int(move_id)], fields=["name", "state", "amount_total", "partner_id", "move_type"])
+        rows = odoo.read_records(
+            "account.move",
+            [int(move_id)],
+            fields=["name", "state", "amount_total", "partner_id", "move_type"],
+        )
         if not rows:
             raise ValueError(f"Beleg {move_id} nicht gefunden.")
         info = rows[0]
         if info.get("state") == "posted":
-            return {"success": True, "tool": tool, "move_id": int(move_id), "state": "posted", "summary": f"{info.get('name')} ist bereits gebucht."}
+            return {
+                "success": True,
+                "tool": tool,
+                "move_id": int(move_id),
+                "state": "posted",
+                "summary": f"{info.get('name')} ist bereits gebucht.",
+            }
         if not bestaetigen:
-            code = register_pending(ctx, instance_name, tool, {"move_id": int(move_id), "name": info.get("name")})
+            code = register_pending(
+                ctx,
+                instance_name,
+                tool,
+                {"move_id": int(move_id), "name": info.get("name")},
+            )
             return _card(
                 tool,
                 "Beleg BUCHEN",
-                {"beleg": info.get("name"), "betrag_chf": info.get("amount_total"), "partner": info["partner_id"][1] if info.get("partner_id") else "-", "typ": info.get("move_type")},
+                {
+                    "beleg": info.get("name"),
+                    "betrag_chf": info.get("amount_total"),
+                    "partner": info["partner_id"][1] if info.get("partner_id") else "-",
+                    "typ": info.get("move_type"),
+                },
                 f"Bist du sicher, dass {info.get('name')} ueber CHF {float(info.get('amount_total') or 0):,.2f} GEBUCHT werden soll?",
                 code,
             )
         payload = take_pending(ctx, instance_name, tool, freigabe_code)
-        gated_method(ctx, "account.move", "action_post", [[payload["move_id"]]], instance=instance_name)
-        after = odoo.read_records("account.move", [payload["move_id"]], fields=["name", "state"])
+        gated_method(
+            ctx,
+            "account.move",
+            "action_post",
+            [[payload["move_id"]]],
+            instance=instance_name,
+        )
+        after = odoo.read_records(
+            "account.move", [payload["move_id"]], fields=["name", "state"]
+        )
         state = after[0].get("state") if after else "?"
-        return {"success": True, "tool": tool, "move_id": payload["move_id"], "state": state, "summary": f"{(after[0].get('name') if after else payload['name'])} wurde gebucht."}
+        return {
+            "success": True,
+            "tool": tool,
+            "move_id": payload["move_id"],
+            "state": state,
+            "summary": f"{(after[0].get('name') if after else payload['name'])} wurde gebucht.",
+        }
     except Exception as exc:  # noqa: BLE001
         return _fail(tool, exc)
 
 
-def pay_invoice(ctx: Context, move_id: int, bestaetigen: bool = False, freigabe_code: Optional[str] = None, instance: Optional[str] = None) -> Dict[str, Any]:
+def pay_invoice(
+    ctx: Context,
+    move_id: int,
+    bestaetigen: bool = False,
+    freigabe_code: Optional[str] = None,
+    instance: Optional[str] = None,
+) -> Dict[str, Any]:
     """Registriert die Zahlung einer gebuchten Rechnung (Zahlungsassistent). Immer mit Karte."""
     tool = "pay_invoice"
     try:
         api = _core()
         instance_name, odoo = api._resolve_odoo(ctx, instance)
-        rows = odoo.read_records("account.move", [int(move_id)], fields=["name", "state", "amount_residual", "partner_id"])
+        rows = odoo.read_records(
+            "account.move",
+            [int(move_id)],
+            fields=["name", "state", "amount_residual", "partner_id"],
+        )
         if not rows:
             raise ValueError(f"Beleg {move_id} nicht gefunden.")
         info = rows[0]
         if info.get("state") != "posted":
-            raise ValueError(f"{info.get('name')} ist nicht gebucht - erst buchen, dann zahlen.")
+            raise ValueError(
+                f"{info.get('name')} ist nicht gebucht - erst buchen, dann zahlen."
+            )
         if not bestaetigen:
-            code = register_pending(ctx, instance_name, tool, {"move_id": int(move_id), "name": info.get("name")})
+            code = register_pending(
+                ctx,
+                instance_name,
+                tool,
+                {"move_id": int(move_id), "name": info.get("name")},
+            )
             return _card(
                 tool,
                 "Rechnung ZAHLEN",
-                {"beleg": info.get("name"), "offen_chf": info.get("amount_residual"), "partner": info["partner_id"][1] if info.get("partner_id") else "-"},
+                {
+                    "beleg": info.get("name"),
+                    "offen_chf": info.get("amount_residual"),
+                    "partner": info["partner_id"][1] if info.get("partner_id") else "-",
+                },
                 f"Bist du sicher, dass fuer {info.get('name')} eine Zahlung ueber CHF {float(info.get('amount_residual') or 0):,.2f} registriert werden soll?",
                 code,
             )
         payload = take_pending(ctx, instance_name, tool, freigabe_code)
-        wizard_ctx = {"active_model": "account.move", "active_ids": [payload["move_id"]]}
+        wizard_ctx = {
+            "active_model": "account.move",
+            "active_ids": [payload["move_id"]],
+        }
         # The gate refuses empty create payloads; the wizard derives everything
         # else from the context, so the payment date is the one explicit value.
-        wizard_id = gated_create(ctx, "account.payment.register", {"payment_date": date.today().isoformat()}, instance=instance_name, context=wizard_ctx)
-        gated_method(ctx, "account.payment.register", "action_create_payments", [[wizard_id]], {"context": wizard_ctx}, instance=instance_name)
-        after = odoo.read_records("account.move", [payload["move_id"]], fields=["name", "payment_state"])
-        return {"success": True, "tool": tool, "move_id": payload["move_id"], "payment_state": after[0].get("payment_state") if after else "?", "summary": f"Zahlung fuer {(after[0].get('name') if after else payload['name'])} registriert."}
+        wizard_id = gated_create(
+            ctx,
+            "account.payment.register",
+            {"payment_date": date.today().isoformat()},
+            instance=instance_name,
+            context=wizard_ctx,
+        )
+        gated_method(
+            ctx,
+            "account.payment.register",
+            "action_create_payments",
+            [[wizard_id]],
+            {"context": wizard_ctx},
+            instance=instance_name,
+        )
+        after = odoo.read_records(
+            "account.move", [payload["move_id"]], fields=["name", "payment_state"]
+        )
+        return {
+            "success": True,
+            "tool": tool,
+            "move_id": payload["move_id"],
+            "payment_state": after[0].get("payment_state") if after else "?",
+            "summary": f"Zahlung fuer {(after[0].get('name') if after else payload['name'])} registriert.",
+        }
     except Exception as exc:  # noqa: BLE001
         return _fail(tool, exc)
 
@@ -1106,7 +1733,15 @@ def einsatzrapport_erstellen(
     try:
         api = _core()
         instance_name, odoo = api._resolve_odoo(ctx, instance)
-        plan = {"kunde": kunde or {}, "standort": standort or {}, "beschreibung": beschreibung, "zeiten": zeiten or [], "material": material or [], "zuschlaege": zuschlaege or [], "monteur": monteur}
+        plan = {
+            "kunde": kunde or {},
+            "standort": standort or {},
+            "beschreibung": beschreibung,
+            "zeiten": zeiten or [],
+            "material": material or [],
+            "zuschlaege": zuschlaege or [],
+            "monteur": monteur,
+        }
         if not plan["kunde"].get("name") or not plan["standort"].get("name"):
             raise ValueError("kunde.name und standort.name sind Pflicht.")
         if not bestaetigen:
@@ -1114,46 +1749,147 @@ def einsatzrapport_erstellen(
             return _card(
                 tool,
                 "Einsatzrapport ANLEGEN",
-                {"kunde": plan["kunde"].get("name"), "standort": plan["standort"].get("name"), "beschreibung": beschreibung, "zeitzeilen": len(plan["zeiten"]), "materialzeilen": len(plan["material"]), "zuschlaege": plan["zuschlaege"], "monteur": monteur or next((z.get("monteur") for z in plan["zeiten"] if z.get("monteur")), None)},
+                {
+                    "kunde": plan["kunde"].get("name"),
+                    "standort": plan["standort"].get("name"),
+                    "beschreibung": beschreibung,
+                    "zeitzeilen": len(plan["zeiten"]),
+                    "materialzeilen": len(plan["material"]),
+                    "zuschlaege": plan["zuschlaege"],
+                    "monteur": monteur
+                    or next(
+                        (z.get("monteur") for z in plan["zeiten"] if z.get("monteur")),
+                        None,
+                    ),
+                },
                 "Soll dieser Einsatz mit allen Zeilen angelegt werden?",
                 code,
             )
         plan = take_pending(ctx, instance_name, tool, freigabe_code)
         protocol: List[str] = []
         k = plan["kunde"]
-        kunde_id = find_or_create(ctx, odoo, "res.partner", [["name", "=", k["name"]]], {key: value for key, value in {"name": k.get("name"), "street": k.get("street"), "zip": k.get("zip"), "city": k.get("city"), "email": k.get("email"), "phone": k.get("phone"), "is_company": True}.items() if value}, instance=instance_name)
+        kunde_id = find_or_create(
+            ctx,
+            odoo,
+            "res.partner",
+            [["name", "=", k["name"]]],
+            {
+                key: value
+                for key, value in {
+                    "name": k.get("name"),
+                    "street": k.get("street"),
+                    "zip": k.get("zip"),
+                    "city": k.get("city"),
+                    "email": k.get("email"),
+                    "phone": k.get("phone"),
+                    "is_company": True,
+                }.items()
+                if value
+            },
+            instance=instance_name,
+        )
         protocol.append(f"Kunde {k['name']} (#{kunde_id})")
         s = plan["standort"]
-        loc = odoo.search_read("fsm.location", [["name", "=", s["name"]]], fields=["id", "partner_id"], limit=1)
+        loc = odoo.search_read(
+            "fsm.location",
+            [["name", "=", s["name"]]],
+            fields=["id", "partner_id"],
+            limit=1,
+        )
         if loc:
             ort_id = int(loc[0]["id"])
         else:
-            ort_id = gated_create(ctx, "fsm.location", {key: value for key, value in {"name": s.get("name"), "owner_id": kunde_id, "street": s.get("street"), "zip": s.get("zip"), "city": s.get("city")}.items() if value}, instance=instance_name)
-            fresh = odoo.search_read("fsm.location", [["id", "=", ort_id]], fields=["partner_id"], limit=1)
+            ort_id = gated_create(
+                ctx,
+                "fsm.location",
+                {
+                    key: value
+                    for key, value in {
+                        "name": s.get("name"),
+                        "owner_id": kunde_id,
+                        "street": s.get("street"),
+                        "zip": s.get("zip"),
+                        "city": s.get("city"),
+                    }.items()
+                    if value
+                },
+                instance=instance_name,
+            )
+            fresh = odoo.search_read(
+                "fsm.location", [["id", "=", ort_id]], fields=["partner_id"], limit=1
+            )
             if fresh and fresh[0].get("partner_id"):
-                gated_write(ctx, "res.partner", [int(fresh[0]["partner_id"][0])], {"parent_id": kunde_id}, instance=instance_name)
+                gated_write(
+                    ctx,
+                    "res.partner",
+                    [int(fresh[0]["partner_id"][0])],
+                    {"parent_id": kunde_id},
+                    instance=instance_name,
+                )
         protocol.append(f"Standort {s['name']} (#{ort_id})")
-        order_values: Dict[str, Any] = {"location_id": ort_id, "description": plan["beschreibung"]}
-        monteur_name = plan.get("monteur") or next((z.get("monteur") for z in plan["zeiten"] if z.get("monteur")), None)
+        order_values: Dict[str, Any] = {
+            "location_id": ort_id,
+            "description": plan["beschreibung"],
+        }
+        monteur_name = plan.get("monteur") or next(
+            (z.get("monteur") for z in plan["zeiten"] if z.get("monteur")), None
+        )
         if monteur_name:
             person_id = fsm_person_id(ctx, odoo, monteur_name, instance=instance_name)
             order_values["person_id"] = person_id
             order_values["person_ids"] = [[4, person_id]]
         order_id = gated_create(ctx, "fsm.order", order_values, instance=instance_name)
-        order = odoo.search_read("fsm.order", [["id", "=", order_id]], fields=["name"], limit=1)
+        order = odoo.search_read(
+            "fsm.order", [["id", "=", order_id]], fields=["name"], limit=1
+        )
         number = order[0]["name"] if order else str(order_id)
         protocol.append(f"Einsatz {number} (#{order_id})")
         for z in plan["zeiten"]:
-            employee_id = find_or_create(ctx, odoo, "hr.employee", [["name", "=", z.get("monteur")]], {"name": z.get("monteur")}, instance=instance_name)
-            line = {"name": z.get("text") or z.get("typ") or "Arbeit", "employee_id": employee_id, "unit_amount": float(z.get("stunden") or 0), "date": z.get("datum") or date.today().isoformat(), "fsm_order_id": order_id}
+            employee_id = find_or_create(
+                ctx,
+                odoo,
+                "hr.employee",
+                [["name", "=", z.get("monteur")]],
+                {"name": z.get("monteur")},
+                instance=instance_name,
+            )
+            line = {
+                "name": z.get("text") or z.get("typ") or "Arbeit",
+                "employee_id": employee_id,
+                "unit_amount": float(z.get("stunden") or 0),
+                "date": z.get("datum") or date.today().isoformat(),
+                "fsm_order_id": order_id,
+            }
             if z.get("typ"):
-                line["time_type_id"] = find_or_create(ctx, odoo, "project.time.type", [["name", "=", z["typ"]]], {"name": z["typ"]}, instance=instance_name)
+                line["time_type_id"] = find_or_create(
+                    ctx,
+                    odoo,
+                    "project.time.type",
+                    [["name", "=", z["typ"]]],
+                    {"name": z["typ"]},
+                    instance=instance_name,
+                )
             gated_create(ctx, "account.analytic.line", line, instance=instance_name)
         if plan["zeiten"]:
             protocol.append(f"{len(plan['zeiten'])} Zeitzeilen")
         for m in plan["material"]:
-            product_id = find_or_create(ctx, odoo, "product.product", [["name", "=", m.get("produkt")]], {"name": m.get("produkt"), "type": "consu", "list_price": float(m.get("preis") or 0)}, instance=instance_name)
-            line = {"order_id": order_id, "product_id": product_id, "quantity": float(m.get("menge") or 1)}
+            product_id = find_or_create(
+                ctx,
+                odoo,
+                "product.product",
+                [["name", "=", m.get("produkt")]],
+                {
+                    "name": m.get("produkt"),
+                    "type": "consu",
+                    "list_price": float(m.get("preis") or 0),
+                },
+                instance=instance_name,
+            )
+            line = {
+                "order_id": order_id,
+                "product_id": product_id,
+                "quantity": float(m.get("menge") or 1),
+            }
             if m.get("edv_nr"):
                 line["edv_number"] = str(m["edv_nr"])
             if m.get("preis"):
@@ -1162,8 +1898,20 @@ def einsatzrapport_erstellen(
         if plan["material"]:
             protocol.append(f"{len(plan['material'])} Materialzeilen")
         for tag in plan["zuschlaege"]:
-            tag_id = find_or_create(ctx, odoo, "fsm.gav.tag", [["name", "=", tag]], {"name": tag}, instance=instance_name)
-            gated_create(ctx, "fsm.gav.line", {"order_id": order_id, "tag_id": tag_id}, instance=instance_name)
+            tag_id = find_or_create(
+                ctx,
+                odoo,
+                "fsm.gav.tag",
+                [["name", "=", tag]],
+                {"name": tag},
+                instance=instance_name,
+            )
+            gated_create(
+                ctx,
+                "fsm.gav.line",
+                {"order_id": order_id, "tag_id": tag_id},
+                instance=instance_name,
+            )
         if plan["zuschlaege"]:
             protocol.append(f"{len(plan['zuschlaege'])} Zuschlaege")
         return {
@@ -1182,25 +1930,73 @@ def einsatzrapport_erstellen(
 # --- registration --------------------------------------------------------------
 
 READ_TOOLS: List[tuple[Callable[..., Any], str]] = [
-    (aktuelles_datum, "Heutiges Datum/Uhrzeit in Schweizer Zeit mit Wochentag, morgen, uebermorgen - fuer relative Datumsangaben zuerst aufrufen"),
-    (get_account_by_code, "Konto im Schweizer KMU-Kontenrahmen nachschlagen (nur lesen)"),
-    (bericht_link, "Adresse des PDF-Berichts zu einem Datensatz liefern (nur lesen, kein Download)"),
+    (
+        aktuelles_datum,
+        "Heutiges Datum/Uhrzeit in Schweizer Zeit mit Wochentag, morgen, uebermorgen - fuer relative Datumsangaben zuerst aufrufen",
+    ),
+    (
+        get_account_by_code,
+        "Konto im Schweizer KMU-Kontenrahmen nachschlagen (nur lesen)",
+    ),
+    (
+        bericht_link,
+        "Adresse des PDF-Berichts zu einem Datensatz liefern (nur lesen, kein Download)",
+    ),
 ]
 WRITE_TOOLS: List[tuple[Callable[..., Any], str]] = [
-    (termin_buchen, "Kalender-Termin anlegen: 1. Aufruf = Karte + freigabe_code, 2. Aufruf mit bestaetigen=true + freigabe_code = anlegen. Zeiten in Schweizer Zeit."),
-    (create_partner, "Kontakt (Kunde/Lieferant) anlegen: Karte, dann bestaetigen=true + freigabe_code."),
-    (notiz_hinterlassen, "Interne Notiz im Chatter eines Datensatzes hinterlassen: Karte, dann bestaetigen=true + freigabe_code."),
+    (
+        termin_buchen,
+        "Kalender-Termin anlegen: 1. Aufruf = Karte + freigabe_code, 2. Aufruf mit bestaetigen=true + freigabe_code = anlegen. Zeiten in Schweizer Zeit.",
+    ),
+    (
+        create_partner,
+        "Kontakt (Kunde/Lieferant) anlegen: Karte, dann bestaetigen=true + freigabe_code.",
+    ),
+    (
+        notiz_hinterlassen,
+        "Interne Notiz im Chatter eines Datensatzes hinterlassen: Karte, dann bestaetigen=true + freigabe_code.",
+    ),
     (create_project, "Projekt anlegen: Karte, dann bestaetigen=true + freigabe_code."),
-    (create_task, "Aufgabe in einem Projekt anlegen: Karte, dann bestaetigen=true + freigabe_code."),
-    (create_quotation, "Offerte/Angebot als Entwurf erstellen (CH-MwSt 8.1 % Standard): Karte, dann bestaetigen=true + freigabe_code."),
-    (update_record, "Beliebigen bestehenden Datensatz aendern (Termin verschieben, Teilnehmer hinzufuegen, Aufgaben-Phase, Offerte/Rechnung-Felder usw.): Karte, dann bestaetigen=true + freigabe_code."),
-    (delete_record, "Beliebigen bestehenden Datensatz unwiderruflich loeschen: Karte, dann bestaetigen=true + freigabe_code."),
-    (auftrag_monteur_zuweisen, "Field-Service-Auftrag einem Monteur zuteilen: Karte, dann bestaetigen=true + freigabe_code."),
-    (auftrag_abschliessen, "Field-Service-Auftrag abschliessen (action_complete): Karte, dann bestaetigen=true + freigabe_code."),
-    (create_invoice, "Rechnung als Entwurf anlegen (CH-MwSt 8.1 % Standard): Karte, dann bestaetigen=true + freigabe_code."),
-    (post_journal_entry, "Beleg/Rechnung buchen (action_post): Karte, dann bestaetigen=true + freigabe_code."),
-    (pay_invoice, "Zahlung fuer eine gebuchte Rechnung registrieren: Karte, dann bestaetigen=true + freigabe_code."),
-    (einsatzrapport_erstellen, "Kompletten Field-Service-Einsatz anlegen (Kunde, Standort, Auftrag, Zeiten, Material, Zuschlaege): Karte, dann bestaetigen=true + freigabe_code."),
+    (
+        create_task,
+        "Aufgabe in einem Projekt anlegen: Karte, dann bestaetigen=true + freigabe_code.",
+    ),
+    (
+        create_quotation,
+        "Offerte/Angebot als Entwurf erstellen (CH-MwSt 8.1 % Standard): Karte, dann bestaetigen=true + freigabe_code.",
+    ),
+    (
+        update_record,
+        "Beliebigen bestehenden Datensatz aendern (Termin verschieben, Teilnehmer hinzufuegen, Aufgaben-Phase, Offerte/Rechnung-Felder usw.): Karte, dann bestaetigen=true + freigabe_code.",
+    ),
+    (
+        delete_record,
+        "Beliebigen bestehenden Datensatz unwiderruflich loeschen: Karte, dann bestaetigen=true + freigabe_code.",
+    ),
+    (
+        auftrag_monteur_zuweisen,
+        "Field-Service-Auftrag einem Monteur zuteilen: Karte, dann bestaetigen=true + freigabe_code.",
+    ),
+    (
+        auftrag_abschliessen,
+        "Field-Service-Auftrag abschliessen (action_complete): Karte, dann bestaetigen=true + freigabe_code.",
+    ),
+    (
+        create_invoice,
+        "Rechnung als Entwurf anlegen (CH-MwSt 8.1 % Standard): Karte, dann bestaetigen=true + freigabe_code.",
+    ),
+    (
+        post_journal_entry,
+        "Beleg/Rechnung buchen (action_post): Karte, dann bestaetigen=true + freigabe_code.",
+    ),
+    (
+        pay_invoice,
+        "Zahlung fuer eine gebuchte Rechnung registrieren: Karte, dann bestaetigen=true + freigabe_code.",
+    ),
+    (
+        einsatzrapport_erstellen,
+        "Kompletten Field-Service-Einsatz anlegen (Kunde, Standort, Auftrag, Zeiten, Material, Zuschlaege): Karte, dann bestaetigen=true + freigabe_code.",
+    ),
 ]
 
 
@@ -1209,6 +2005,14 @@ def register(api: Any) -> None:
     from odoo_mcp.server_core import DESTRUCTIVE_TOOL
 
     for fn, description in READ_TOOLS:
-        api.tool(description=description, annotations=api.READ_ONLY_TOOL, structured_output=True)(fn)
+        api.tool(
+            description=description,
+            annotations=api.READ_ONLY_TOOL,
+            structured_output=True,
+        )(fn)
     for fn, description in WRITE_TOOLS:
-        api.tool(description=description, annotations=DESTRUCTIVE_TOOL, structured_output=True)(fn)
+        api.tool(
+            description=description,
+            annotations=DESTRUCTIVE_TOOL,
+            structured_output=True,
+        )(fn)

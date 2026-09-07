@@ -41,6 +41,39 @@ All notable changes to this project will be documented in this file.
   `algorithma-vnext-architecture.md`, `per-request-identity.md`,
   `migration-from-algorithma-mcp.md`.
 
+## [1.4.0] - 2026-09-07
+
+### Fixed
+
+- **Local time was only converted to UTC when booking an appointment.** Odoo
+  stores datetimes in UTC and renders them in the reader's timezone, so a naive
+  value handed straight to Odoo is read as UTC and comes back shifted — in
+  Zurich +1h in winter, +2h in summer. `termin_buchen` converted its own
+  `start`/`stop` and was the only tool in the plugin that did, so **creating**
+  an appointment for 10:00 landed at 10:00 while **moving** it to 10:00 landed
+  at 12:00. `update_record`, which its own docstring recommends for
+  «einen Termin verschieben», passed the value through untouched.
+  `localize_datetime_values()` now converts at the single choke point both
+  `gated_create` and `gated_write` pass through, so every tool is covered and
+  the rule lives in one place. Which fields are datetimes is asked of Odoo
+  rather than hardcoded, so `date_order`, `date_deadline` and custom fields are
+  included without a list to maintain. `date` fields are deliberately left
+  alone (a calendar day has no timezone), values that already carry an offset
+  are not converted twice, unparseable values pass through so Odoo can reject
+  them with its own message, and a failure reading field metadata never blocks
+  the write.
+- **`update_record` and `execute_approved_write` rejected the JSON-text form of
+  their payload.** `preview_write` and `validate_write` accept `values_json`
+  because the object parameter becomes an `anyOf` union in the tool schema that
+  models author unreliably — it arrives as `values: {}`. The agent prompt
+  therefore instructs the model to always send JSON text, and the two tools that
+  actually commit the write were the ones that could not honour it: the flow
+  ended in `1 validation error ... values Field required`. Both now accept
+  `values_json` / `approval_json`, coerced exactly as the core tools already do.
+  The object form keeps working for direct callers; when both are present the
+  object wins. A missing `approval` now fails with a sentence naming what to
+  pass instead of a pydantic dump.
+
 ## [1.3.2] - 2026-08-19
 
 ### Changed
