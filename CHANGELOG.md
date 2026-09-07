@@ -4,6 +4,43 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added (Algorithma fork — per-request identity)
+
+- `ODOO_MCP_IDENTITY_MODE=request`: every MCP call authenticates against Odoo as the
+  user named in the `X-User-Email` / `X-Odoo-Api-Key` headers (optional
+  `X-LibreChat-User-Id` for audit). Odoo ACLs and record rules stay authoritative;
+  configured credentials are never used on this path, missing or invalid identities
+  fail closed, and request mode refuses to start over stdio. Default `configured`
+  mode is byte-identical to upstream. New core module `odoo_mcp/identity.py`;
+  `build_identity_client()`; identity-aware `_resolve_odoo()` (builtin tools and
+  plugins alike). Instance (WHERE) and identity (WHO) remain separate concepts.
+- Bounded TTL/LRU cache of per-identity clients keyed by a digest of instance,
+  database, login and credential (`ODOO_MCP_IDENTITY_CACHE_MAX`,
+  `ODOO_MCP_IDENTITY_CACHE_TTL`).
+- Write approvals bound to the requesting user and instance: the canonical payload
+  carries `principal` in request mode and the server-side approval record carries an
+  identity binding; `execute_approved_write` and `chatter_post` refuse tokens from
+  another user, credential, or instance. Token comparison is constant-time.
+- Audit lines gain `principal` and `client_user_id`; `health_check` and
+  `odoo-mcp --health` gain an `identity` posture with warnings for insecure setups.
+- `plugins/algorithma_workflows`: the Algorithma intent tools from A-Odoo-MCP 3.3.x
+  (`termin_buchen`, `create_partner`, `get_account_by_code`, `bericht_link`,
+  `auftrag_monteur_zuweisen`, `auftrag_abschliessen`, `create_invoice`,
+  `post_journal_entry`, `pay_invoice`, `einsatzrapport_erstellen`) as an
+  `odoo_mcp.tools` entry-point plugin. Two-call confirmation (German card +
+  identity-bound, single-use `freigabe_code`), every write through
+  `validate_write` → `execute_approved_write`, methods through `execute_method`'s
+  side-effect policy, Europe/Zurich → UTC for appointments. `Dockerfile.algorithma`
+  builds core + plugin; `examples/algorithma-vnext/mcp-instructions.de.md` carries
+  the model-facing guidance.
+- `scripts/identity_client.py` (Streamable HTTP client with identity headers, A/B
+  compare, fail-closed probe), `scripts/run_request_mode.sh`,
+  `scripts/algorithma_identity_smoke.py` (two restricted users + record rule on a
+  disposable Odoo 18), `examples/algorithma-vnext/` (bauag2 instance config without
+  credentials, Algorithma AI data policy as field ACL), docs
+  `algorithma-vnext-architecture.md`, `per-request-identity.md`,
+  `migration-from-algorithma-mcp.md`.
+
 ## [1.3.2] - 2026-08-19
 
 ### Changed
