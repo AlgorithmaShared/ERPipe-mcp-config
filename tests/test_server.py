@@ -3194,6 +3194,10 @@ def test_execute_approved_write_runs_unlink_path(monkeypatch):
 
         def execute_method(self, *args, **kwargs):
             calls.append((args, kwargs))
+            # Odoo's read returns rows; the unlink path snapshots them before
+            # deleting, so the double has to answer read realistically.
+            if len(args) > 1 and args[1] == "read":
+                return [{"id": 7, "name": "Snapshot Me"}]
             return True
 
     ctx = FakeCtx(_Client())
@@ -3201,7 +3205,11 @@ def test_execute_approved_write_runs_unlink_path(monkeypatch):
     monkeypatch.setenv("ODOO_MCP_ENABLE_WRITES", "1")
     result = server.execute_approved_write(ctx, validation["approval"], confirm=True)
     assert result["success"] is True
-    assert calls[0][0] == ("res.partner", "unlink", [7])
+    # A before-image read precedes the unlink so the audit trail can say
+    # what was in the record once it no longer exists.
+    assert calls[0][0] == ("res.partner", "read", [7])
+    assert calls[1][0] == ("res.partner", "unlink", [7])
+    assert result["before_image_captured"] is True
 
 
 # ----- scan_addons_source / build_domain / business_pack tool wrappers --
